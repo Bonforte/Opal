@@ -1,0 +1,16 @@
+
+- fear greed index - useless as of now (mimics stocks at a general level)
+- volum
+- suprafata dintre linii
+
+- ADX (how much it increased between the intersection and the surface threshold)
+
+1. surface between the lines.
+2. ADX over specific threshold customized based on individual stock history.(calculated at surface fill)
+3. vix lower than 27 ????????? (to be investigated)
+
+
+
+how many intersections in last month? - limited by surface between lines
+
+suprafata mica de filtrare si panta linilor ichimoku > 30%

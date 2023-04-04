@@ -1,0 +1,279 @@
+import yfinance as yf
+from datetime import timedelta, datetime
+import mplfinance as mpf
+import pandas as pd
+from numpy import trapz
+
+def compute_ichimoku(df_stock):
+    #Tenkan Sen
+    tenkan_max = df_stock['High'].rolling(window = 9, min_periods = 0).max()
+    tenkan_min = df_stock['Low'].rolling(window = 9, min_periods = 0).min()
+    df_stock['tenkan_avg'] = (tenkan_max + tenkan_min) / 2
+
+    #Kijun Sen
+    kijun_max = df_stock['High'].rolling(window = 26, min_periods = 0).max()
+    kijun_min = df_stock['Low'].rolling(window = 26, min_periods = 0).min()
+    df_stock['kijun_avg'] = (kijun_max + kijun_min) / 2
+
+    df_stock['senkou_a'] = ((df_stock['kijun_avg'] + df_stock['tenkan_avg']) / 2).shift(26)
+
+    #Senkou Span B
+    #52 period High + Low / 2
+    senkou_b_max = df_stock['High'].rolling(window = 52, min_periods = 0).max()
+    senkou_b_min = df_stock['Low'].rolling(window = 52, min_periods = 0).min()
+    df_stock['senkou_b'] = ((senkou_b_max + senkou_b_min) / 2).shift(52)
+
+    return df_stock
+
+# ADX Plot
+def get_adx(high, low, close, lookback):
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm > 0] = 0
+    
+    tr1 = pd.DataFrame(high - low)
+    tr2 = pd.DataFrame(abs(high - close.shift(1)))
+    tr3 = pd.DataFrame(abs(low - close.shift(1)))
+    frames = [tr1, tr2, tr3]
+    tr = pd.concat(frames, axis = 1, join = 'inner').max(axis = 1)
+    atr = tr.rolling(lookback).mean()
+    
+    plus_di = 100 * (plus_dm.ewm(alpha = 1/lookback).mean() / atr)
+    minus_di = abs(100 * (minus_dm.ewm(alpha = 1/lookback).mean() / atr))
+    dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
+    adx = ((dx.shift(1) * (lookback - 1)) + dx) / lookback
+    adx_smooth = adx.ewm(alpha = 1/lookback).mean()
+    return plus_di, minus_di, adx_smooth
+
+def get_surfaces(df_stock, date_intervals):
+    counter=0
+    surfaces=[]
+
+    for interval in date_intervals:
+        filtered_df = df_stock[(df_stock['Date']>interval[0]) & (df_stock['Date']<interval[1])]
+        interval_values = filtered_df[['tenkan_avg', 'kijun_avg']]
+
+        interval_buy_line = interval_values['tenkan_avg']
+        interval_sell_line = interval_values['kijun_avg']
+
+        buy_area_interval = trapz(interval_buy_line, dx=1)
+        sell_area_interval = trapz(interval_sell_line, dx=1)
+
+        area_between_lines_interval = abs(buy_area_interval - sell_area_interval)
+        counter+=1
+        surfaces.append(abs(area_between_lines_interval))
+    return surfaces
+
+def parse_surfaces(surfaces):
+    surface_average = float(sum(surfaces)/len(surfaces))
+    low_values = [value for value in surfaces if value<=surface_average/2]
+    #low_values_average = float(sum(low_values)/len(low_values))
+    surface_threshold = 6.5
+    return surface_threshold
+
+def last_surface_trigger(df_stock, border_dates, SURFACE_THESHOLD):
+    filtered_df_stock = df_stock[df_stock['Date']>=border_dates[-2]]
+    
+    for index, entry in filtered_df_stock.iterrows():
+        entry_flag = False
+        buy_flag=None
+        current_date = entry['Date']
+        final_df_stock = filtered_df_stock[filtered_df_stock['Date']<=current_date]
+        interval_buy_line = final_df_stock['tenkan_avg']
+        interval_sell_line = final_df_stock['kijun_avg']
+
+        buy_area_interval = trapz(interval_buy_line, dx=1)
+        sell_area_interval = trapz(interval_sell_line, dx=1)
+
+        area_between_lines_interval = buy_area_interval - sell_area_interval
+        
+        if(abs(area_between_lines_interval) >= SURFACE_THESHOLD):
+            entry_flag = True
+
+            if(area_between_lines_interval >= 0):
+                buy_flag=True
+            else:
+                buy_flag=False
+
+        if entry_flag:
+            return current_date, buy_flag, entry['adx']
+        
+
+    return None, None, None
+
+def test_profit(df_stock, date_intervals, SURFACE_THESHOLD, entry_border, stop_border):
+    stock_transactions = []
+    transactions = []
+    loss_percentages = []
+    for interval in date_intervals:
+        filtered_df_stock = df_stock[(df_stock['Date']>=interval[0]) & (df_stock['Date']<=interval[1])]
+        entry_price = None
+        stop_price = None
+        entry_flag = False
+        buy_flag = None
+        slope_sell = None
+        slope_buy = None
+        stop_counter = 0
+        take_profit_percentage_list = []
+        transaction_profits_list = []
+        for index, entry in filtered_df_stock.iterrows():
+            
+            current_date = entry['Date']
+            intermediary_df_stock = filtered_df_stock[filtered_df_stock['Date']<=current_date]
+            #print(intermediary_df_stock)
+            interval_buy_line = intermediary_df_stock['tenkan_avg']
+            interval_sell_line = intermediary_df_stock['kijun_avg']
+            if len(interval_sell_line) > 2 and len(interval_buy_line) > 2:
+                x1_sell,y1_sell = 1, interval_sell_line[-2]
+                x2_sell,y2_sell = 2, interval_sell_line[-1]
+                slope_sell = ((y2_sell-y1_sell)/(x2_sell-x1_sell))
+                x1_buy,y1_buy = 1, interval_buy_line[-2]
+                x2_buy,y2_buy = 2, interval_buy_line[-1]
+                slope_buy = ((y2_buy-y1_buy)/(x2_buy-x1_buy))
+
+            buy_area_interval = trapz(interval_buy_line, dx=1)
+            sell_area_interval = trapz(interval_sell_line, dx=1)
+            area_between_lines_interval = buy_area_interval - sell_area_interval
+            
+
+            slope_intent = (slope_sell>=entry_border and slope_buy>=entry_border) or  (slope_sell<=-entry_border and slope_buy<=-entry_border) if slope_sell and slope_buy else False
+            #print(slope_intent)
+            # and ((entry['High'] >= entry['senkou_a'] and entry['High'] >= entry['senkou_b']) or (entry['Low'] <= entry['senkou_a'] and entry['Low'] <= entry['senkou_b']))
+            if (abs(area_between_lines_interval) >= SURFACE_THESHOLD) and slope_intent and ((entry['Close'] >= entry['senkou_a'] and entry['Close'] >= entry['senkou_b']) or (entry['Close'] <= entry['senkou_a'] and entry['Close'] <= entry['senkou_b'])):
+                entry_flag = True
+
+                if(area_between_lines_interval >= 0):
+                    buy_flag=True
+                elif area_between_lines_interval < 0:
+                    buy_flag=False
+
+            if entry_flag:
+                if not entry_price:
+                    entry_price = entry['High']
+                    entry_date = entry['Date'] 
+
+                if (buy_flag and (slope_buy<-stop_border or slope_sell<-stop_border)) or (not buy_flag and (slope_buy>stop_border or slope_sell>stop_border)):
+                    
+                    stop_price = entry['High']
+                    stop_date = entry['Date']
+
+                if entry_price and stop_price:
+                    transaction_profit = (stop_price/entry_price * 100) - 100
+                    transaction_profit = transaction_profit
+
+                    loss_percentage = 0
+                    transaction_filtered_df_Stock = df_stock[(df_stock['Date']>=entry_date) & (df_stock['Date']<=stop_date)]
+                    if buy_flag and transaction_profit >= 0:
+                        minimum_transaction_price = min(transaction_filtered_df_Stock['Low'])
+                        maximum_transaction_price = max(transaction_filtered_df_Stock['High'])
+                        transaction_profits_list.append(transaction_profit)
+
+                        if minimum_transaction_price < entry_price:
+                            difference = entry_price - minimum_transaction_price
+                            loss_percentage = difference/entry_price * 100
+
+                        if maximum_transaction_price > stop_price:
+                            difference = maximum_transaction_price - stop_price
+                            take_profit_percentage_list.append(difference/stop_price * 100)
+
+                    elif not buy_flag and transaction_profit<0:
+                        maximum_transaction_price = max(transaction_filtered_df_Stock['High'])
+                        minimum_transaction_price = min(transaction_filtered_df_Stock['Low'])
+                        transaction_profits_list.append(transaction_profit)
+
+                        if maximum_transaction_price > entry_price:
+                            difference = maximum_transaction_price - entry_price
+                            loss_percentage = difference/entry_price * 100
+
+                        if minimum_transaction_price < stop_price:
+                            difference = stop_price - minimum_transaction_price
+                            take_profit_percentage_list.append(difference/stop_price * 100)
+
+                    loss_percentages.append(loss_percentage)
+
+                    
+                    if(buy_flag):
+                        transactions.append(f'{current_date} - {float(entry_price)} -> {float(stop_price)} (BUY)')
+                    else:
+                        transactions.append(f'{current_date} - {float(entry_price)} -> {float(stop_price)} (SELL)')
+                    if (buy_flag and transaction_profit >= 0) or (not buy_flag and transaction_profit<0):
+                        profit_string = abs(transaction_profit)
+                    if (buy_flag and transaction_profit < 0)  or (not buy_flag and transaction_profit>=0):
+                        profit_string = -abs(transaction_profit)
+
+                    stock_transactions.append(profit_string)
+                    break
+    return stock_transactions, transactions, max(loss_percentages) if loss_percentages else 0, take_profit_percentage_list, transaction_profits_list
+                
+
+def get_stock_state(stock_ticker, last_interval_df, SURFACE_THESHOLD, entry_border, stop_border):
+
+    entry_flag = False
+    stop_flag = False
+    buy_flag = None
+    slope_sell = None
+    slope_buy = None
+    state = 'N/A'
+    update_date = None
+    entry_flag = False
+    stop_flag = False
+    for index, entry in last_interval_df.iterrows():
+        
+        
+        
+        current_date = entry['Date']
+        intermediary_df_stock = last_interval_df[last_interval_df['Date']<=current_date]
+        interval_buy_line = intermediary_df_stock['tenkan_avg']
+        interval_sell_line = intermediary_df_stock['kijun_avg']
+
+        if len(interval_sell_line) > 2 and len(interval_buy_line) > 2:
+            x1_sell,y1_sell = 1, interval_sell_line[-2]
+            x2_sell,y2_sell = 2, interval_sell_line[-1]
+            slope_sell = ((y2_sell-y1_sell)/(x2_sell-x1_sell))
+            x1_buy,y1_buy = 1, interval_buy_line[-2]
+            x2_buy,y2_buy = 2, interval_buy_line[-1]
+            slope_buy = ((y2_buy-y1_buy)/(x2_buy-x1_buy))
+           
+        buy_area_interval = trapz(interval_buy_line, dx=1)
+        sell_area_interval = trapz(interval_sell_line, dx=1)
+        area_between_lines_interval = buy_area_interval - sell_area_interval
+
+        slope_intent = (slope_sell>=entry_border and slope_buy>=entry_border) or  (slope_sell<=-entry_border and slope_buy<=-entry_border) if slope_sell and slope_buy else False
+        
+        if (abs(area_between_lines_interval) >= SURFACE_THESHOLD) and slope_intent and ((entry['Close'] > entry['senkou_a'] and entry['Close'] > entry['senkou_b']) or (entry['Close'] < entry['senkou_a'] and entry['Close'] < entry['senkou_b'])):
+            entry_flag = True
+
+            if(area_between_lines_interval >= 0):
+                buy_flag=True
+            elif area_between_lines_interval < 0:
+                buy_flag=False
+
+        if entry_flag and buy_flag and state == 'N/A':
+            state = 'BUY'
+            update_date = current_date
+
+        if entry_flag and not buy_flag and state == 'N/A':
+            state = 'SELL'
+            update_date = current_date
+        
+        if entry_flag:
+            if (buy_flag and (slope_buy<-stop_border or slope_sell<-stop_border)) or (not buy_flag and (slope_buy>stop_border or slope_sell>stop_border)):
+                stop_flag = True
+
+        if stop_flag and buy_flag:
+            state = 'STOP BUY'
+            update_date = current_date
+            current_date = last_interval_df['Date'].iloc[-1]
+            break
+
+        if stop_flag and not buy_flag:
+            state = 'STOP SELL'
+            update_date = current_date
+            current_date = last_interval_df['Date'][-1]
+            break
+
+    if current_date and update_date and update_date >= current_date - timedelta(days=2):
+        return f'\033[1m {stock_ticker} \033[0m - {state} - {update_date.strftime("%Y-%m-%d")} \033[1m(HOT!!)\033[0m'
+    
+    return f'\033[1m {stock_ticker} \033[0m - {state} - {update_date.strftime("%Y-%m-%d") if update_date else update_date}'
